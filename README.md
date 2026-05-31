@@ -51,7 +51,7 @@ k8s-Cilium— K8s HA 集群自动化部署（Cilium CNI）
 | Kubernetes | v1.35.5 |
 | containerd | v2.2.x |
 | Cilium | v1.18.10 |
-| Helm | v3.17.3 |
+| Helm | v4.2.0 |
 
 ---
 
