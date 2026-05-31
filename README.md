@@ -28,87 +28,20 @@ k8s-Cilium— K8s HA 集群自动化部署（Cilium CNI）
 
 **etcd quorum = 2（3节点）**：任意一个控制节点宕机，集群写入不受影响。
 
----
-
 ## 节点规划
 
-| 角色 | 主机名 | IP |
-|------|--------|----|
-| Ansible 控制机 | ollama | 192.168.88.118 |
-| 控制节点 | master1 | 192.168.88.119 |
-| 控制节点 | master2 | 192.168.88.120 |
-| 控制节点 | master3 | 192.168.88.124 |
-| 工作节点 | worker1 | 192.168.88.121 |
-| 工作节点 | worker2 | 192.168.88.122 |
-| 工作节点 | worker3 | 192.168.88.123 |
-| VIP | — | 192.168.88.200 |
+| 角色 | 主机名 | IP | 说明 |
+|------|--------|----|------|
+| 控制机（Ansible） | ollama | 192.168.88.118 | 不加入集群 |
+| 控制节点 | master1 | 192.168.88.119 | 初始主节点 |
+| 控制节点 | master2 | 192.168.88.120 | |
+| 控制节点 | master3 | 192.168.88.124 | |
+| 工作节点 | worker1 | 192.168.88.121 | |
+| 工作节点 | worker2 | 192.168.88.122 | |
+| 工作节点 | worker3 | 192.168.88.123 | |
+| VIP | — | 192.168.88.200 | 同网段空闲 IP |
 
 ---
-
-## 核心技术亮点
-
-### 1. VMware ARP 问题修复
-
-VMware 虚拟交换机过滤 Gratuitous ARP，导致 worker 节点无法通过 VIP 访问 API Server。
-
-**解决方案：动态 DNAT**
-
-```bash
-# 每10秒通过 arping 检测 VIP 当前持有者
-# 自动更新 iptables DNAT 规则
-VIP_HOLDER=$(arping -c 2 -I $NIC $VIP | grep "Unicast reply" | awk '{print $5}')
-iptables -t nat -I OUTPUT 1 -d $VIP -p tcp --dport 6443 \
-  -j DNAT --to-destination ${VIP_HOLDER}:6443
-```
-
-### 2. kubeadm JSON Patch
-
-kube-apiserver 需要绑定节点 IP（而非 0.0.0.0），以避免与 HAProxy 端口冲突：
-
-```json
-[{"op": "add", "path": "/spec/containers/0/command/-",
-  "value": "--bind-address=节点IP"}]
-```
-
-只 patch kube-apiserver，不影响 controller-manager 和 scheduler。
-
-### 3. kubeconfig 直连节点 IP
-
-每个 master 的 kubeconfig `server` 字段指向本节点 IP，而非 VIP。  
-master 宕机时，其他 master 的 kubectl 不受影响。
-
-### 4. Keepalived notify 脚本
-
-VIP 漂移时自动管理 DNAT：
-- `notify_master`：本节点持有 VIP → 清除所有 DNAT（本地 HAProxy 直接处理）
-- `notify_backup`：本节点失去 VIP → 设置 DNAT 指向 VIP 新持有者
-
----
-
-## 快速开始
-
-### 环境准备
-
-```bash
-# 控制机（192.168.88.118）安装 Ansible
-dnf install -y ansible
-
-# 所有节点 SSH 免密
-for ip in 119 120 121 122 123 124; do
-  ssh-copy-id root@192.168.88.$ip
-done
-
-# 验证连通性
-ansible -i k8s-final9/inventory.ini all -m ping
-```
-# Cilium 方案（高性能）
-cd k8s-Cilium-v5
-ansible-playbook -i inventory.ini site.yml
-
-## 重置集群
-
-```bash
-ansible-playbook -i inventory.ini reset.yml
 
 ## 软件版本
 
@@ -118,65 +51,140 @@ ansible-playbook -i inventory.ini reset.yml
 | Kubernetes | v1.35.5 |
 | containerd | v2.2.x |
 | Cilium | v1.18.10 |
-| Helm | v4.2.0 |
+| Helm | v3.17.3 |
 
-## 镜像来源汇总
+---
 
-所有镜像均来自国内可访问的镜像仓库：
+## 快速开始
 
-| 组件 | 镜像源 |
-|------|--------|
-| K8s 核心 | registry.aliyuncs.com/google_containers |
-| Cilium | swr.cn-north-4.myhuaweicloud.com/ddn-k8s/docker.io/cilium |
+### 前置条件
 
+```bash
+# 控制机安装 Ansible
+dnf install -y ansible
+
+# 配置所有节点 SSH 免密
+for ip in 192.168.88.119 192.168.88.120 192.168.88.121 \
+          192.168.88.122 192.168.88.123 192.168.88.124; do
+  ssh-copy-id root@$ip
+done
+```
+
+### 修改配置
+
+```bash
+vim group_vars/all.yml   # 修改 VIP 等变量
+vim inventory.ini        # 修改节点 IP
+```
+
+### 部署
+
+```bash
+# 全新部署
+ansible-playbook -i inventory.ini site.yml
+
+# 重置后重新部署
+ansible-playbook -i inventory.ini reset.yml
+rm -f /tmp/k8s_worker_join.sh /tmp/k8s_master_join.sh
+ansible-playbook -i inventory.ini site.yml
+```
+
+> 注意：Cilium 镜像较大（约 300MB），首次部署约需 20-30 分钟。
+
+---
+
+## 部署流程
+
+```
+Step 1  所有节点系统初始化
+Step 2  所有节点安装 containerd
+Step 3  所有节点安装 kubelet/kubeadm/cri-tools + 预拉取 Cilium 镜像
+Step 4  控制节点启动 Keepalived
+Step 5  master1 启动 HAProxy
+Step 6  master1 kubeadm init（跳过 kube-proxy）+ 安装 Helm + 部署 Cilium
+Step 7  master2/master3 串行加入控制平面
+Step 8  master2/master3 启动 HAProxy
+Step 9  worker 加入集群
+Step 10 等待全部 6 个节点 Ready
+Step 11 输出最终状态报告
+```
+
+---
+
+## Cilium 关键配置
+
+```yaml
+# kube-proxy 完全替换（eBPF 实现 Service 路由）
+kubeProxyReplacement: true
+k8sServiceHost: "192.168.88.200"
+k8sServicePort: "6443"
+
+# 隧道模式（兼容 VMware 环境）
+tunnelProtocol: "vxlan"
+
+# Hubble 可观测性（默认开启）
+hubble:
+  enabled: true
+  relay:
+    enabled: true
+  ui:
+    enabled: true
+```
+
+---
+
+## 镜像来源
+
+所有 Cilium 镜像通过华为云 SWR 拉取（`image.override` 方式完全覆盖 chart 默认地址）：
+
+| 组件 | 镜像 |
+|------|------|
+| Cilium Agent | swr.cn-north-4.myhuaweicloud.com/ddn-k8s/docker.io/cilium/cilium:v1.18.10 |
+| Cilium Operator | swr.cn-north-4.myhuaweicloud.com/ddn-k8s/docker.io/cilium/operator-generic:v1.18.10 |
+| Hubble Relay | swr.cn-north-4.myhuaweicloud.com/ddn-k8s/docker.io/cilium/hubble-relay:v1.18.10 |
+| Hubble UI | swr.cn-north-4.myhuaweicloud.com/ddn-k8s/docker.io/cilium/hubble-ui:v0.13.3 |
+| K8s 核心组件 | registry.aliyuncs.com/google_containers |
+
+---
+
+## 验证集群
+
+```bash
+# 节点状态
+kubectl get nodes -o wide
+
+# Cilium Pod 状态
+kubectl get pods -n kube-system -l k8s-app=cilium -o wide
+
+# Cilium 健康检查
+kubectl exec -n kube-system ds/cilium -- cilium status
+
+# 确认 kube-proxy 已被替换（应无 kube-proxy Pod）
+kubectl get pods -n kube-system | grep kube-proxy
+
+# Hubble 流量监控
+kubectl exec -n kube-system ds/cilium -- hubble observe --last 20
+```
 
 ---
 
 ## 目录结构
 
 ```
-.
-── k8s-Cilium-v5/             # Cilium 方案
-    ├── README.md
-    ├── inventory.ini
-    ├── group_vars/all.yml
-    ├── site.yml
-    ├── reset.yml
-    └── roles/
+k8s-Cilium-v5/
+├── inventory.ini
+├── group_vars/all.yml         # Cilium 镜像、版本等变量
+├── site.yml
+├── reset.yml                  # 含 Cilium 网络接口清理
+└── roles/
+    ├── common/                # sysctl 含 eBPF 所需参数
+    ├── containerd/
+    ├── kubernetes/            # 预拉取 Cilium 镜像
+    ├── keepalived_only/
+    ├── haproxy_only/
+    ├── master_init/           # kubeadm init（skip kube-proxy）+ Helm + Cilium
+    ├── master_join/
+    └── worker_join/
 ```
 
----
-
-## 常见问题
-
-**Q: master 宕机后 worker 节点 NotReady？**  
-A: 等待约 10-20 秒，动态 DNAT 定时器会自动更新路由。  
-查看日志：`cat /var/log/k8s-dnat.log`
-
-**Q: crictl 不可用？**  
-A: cri-tools 已在 Step 3 安装。若仍不可用：  
-`ansible -i inventory.ini all -m dnf -a "name=cri-tools state=present"`
-
-**Q: Cilium 部署超时？**  
-A: Cilium 镜像约 300MB，首次拉取需要时间。部署超时不代表失败，  
-检查：`kubectl get pods -n kube-system -l k8s-app=cilium`
-
-**Q: 如何验证 HA？**  
-```bash
-# 在 master1 上执行
-poweroff
-
-# 在 master2 上验证（约30秒后）
-kubectl get nodes
-kubectl get pods -A
-```
-
----
-
-## License
-
-MIT License
-
----
-
-> 本项目经过多轮实际部署验证，欢迎 Issue 和 PR。
+---，欢迎 Issue 和 PR。
